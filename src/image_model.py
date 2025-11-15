@@ -162,7 +162,8 @@ class C2F_Seg(nn.Module):
 
     def get_losses(self, meta):
         """
-        MAE 版本的训练损失计算（方案C：预测Latent并解码
+        MAE 版本的训练损失计算
+        [修改后：增加了粗糙阶段的 VGG 损失]
         """
         self.iteration += 1
         
@@ -180,12 +181,9 @@ class C2F_Seg(nn.Module):
         # 2. 目标(Target)是完整的像素块
         target = fm_patches_input # 形状: [B, 256, 256]
         
-        # ========== 【关键修正点：创建正确的 Mask】 ==========
-        # (这部分采用了您上一条消息中的正确逻辑)
-        
-        num_patches = target.shape[1]  # 确保这里是 256
+        # ========== 创建正确的 Mask ==========
+        num_patches = target.shape[1]  # 256
         if num_patches != 256:
-             # 如果这里触发，说明您的数据加载器或配置有问题
              raise ValueError(f"Dataloader returned patch sequence of length {num_patches}, expected 256.")
 
         r = np.maximum(self.gamma(np.random.uniform()), self.config.min_mask_rate)
@@ -197,19 +195,15 @@ class C2F_Seg(nn.Module):
         random_mask.scatter_(dim=1, index=sample, value=True)
 
         # 3. 创建 Masked Input (z_indices_input)
-        # 扩展维度 [B, 256] -> [B, 256, 1]
-        mask_expanded = random_mask.unsqueeze(-1)  
+        mask_expanded = random_mask.unsqueeze(-1)  # [B, 256, 1]
         
-        # 使用 [B, 256, 1] 的掩码广播到 [B, 256, 256] 的数据
-        # (这就是您报错的 line 213，现在它是正确的)
         z_indices_input = torch.where(
             mask_expanded,
             torch.zeros_like(fm_patches_input),
             fm_patches_input
         )
-        # ========== 【修正结束】 ==========
         
-        # 4. Transformer 预测 Latent
+        # 4. Transformer 预测 Patches
         pred_pixel_patches = self.transformer(
             img_feat[-1],
             vm_patches_input,
@@ -218,39 +212,50 @@ class C2F_Seg(nn.Module):
         ) # Shape: [B, 256, 256]
         
         
-
-
-        # ✅ 步骤 7 (修改): 计算 z_loss (整张图 vs 整张图)
-        # (目标现在是 meta['fm_crop']，即 [B, 1, 256, 256] 的真实掩码)
+        # 5. 计算 MAE 损失 (z_loss_mae)
+        # (仅在被掩蔽的 patch 上计算 MSE)
         loss_patches = self.criterion(pred_pixel_patches, target) # [B, 256, 256]
-        # (b) 准备掩码 (random_mask 是 [B, 256])
         mask_for_loss = random_mask.unsqueeze(-1) # [B, 256, 1]
-        z_loss = (loss_patches * mask_for_loss).sum() / (mask_for_loss.sum() * 256 + 1e-6)
+        z_loss_mae = (loss_patches * mask_for_loss).sum() / (mask_for_loss.sum() * 256 + 1e-6)
         
-        # 6. [修改] 从预测的 patches 重建粗糙掩码
-        with torch.no_grad():
-            # (a) 将 Transformer 的输出 [B, 256, 256] (B, L, C*k*k) 
-            #     转换为 [B, 256, 256] (B, C*k*k, L) 以便 F.fold
-            patches_for_fold = pred_pixel_patches.transpose(1, 2)
-            
-            # (b) 使用 F.fold 将 patches 拼回完整图像
-            #     (F.fold 是 F.unfold 的逆操作)
-            coarse_pred_fm_logits = F.fold(
-                patches_for_fold,
-                output_size=(256, 256), # 目标输出尺寸
-                kernel_size=patch_size, # 16
-                stride=patch_size       # 16
-            ) # [B, 1, 256, 256]
+        # 6. [修改] 从预测的 patches 重建粗糙掩码 (用于 VGG 损失 和 Refine 阶段)
+        # !!! 注意：F.fold 操作现在在 no_grad() 块之外 !!!
+        patches_for_fold = pred_pixel_patches.transpose(1, 2)
+        
+        coarse_pred_fm_logits = F.fold(
+            patches_for_fold,
+            output_size=(256, 256), # 目标输出尺寸
+            kernel_size=patch_size, # 16
+            stride=patch_size       # 16
+        ) # [B, 1, 256, 256]
 
-            # (c) 应用 Sigmoid 供 Refine 模块使用
+        # 7. 【新增：计算粗糙掩码的 VGG 损失】
+        z_vgg_loss = torch.tensor(0.0, device=z_loss_mae.device) # 初始化为 0
+        
+        # 检查 self.perceptual_loss 是否已在 __init__ 中成功初始化
+        if self.perceptual_loss is not None:
+            # (a) 将 logits 转换为 VGG 期望的 [-1, 1] 范围
+            #     (Sigmoid -> [0, 1], * 2.0 - 1.0 -> [-1, 1])
+            pred_img_for_vgg = torch.sigmoid(coarse_pred_fm_logits) * 2.0 - 1.0
+            pred_img_3ch = pred_img_for_vgg.repeat(1, 3, 1, 1) # [B, 3, 256, 256]
+            
+            # (b) 将目标掩码也转换为 [-1, 1] 范围
+            target_img = meta['fm_crop'].float() * 2.0 - 1.0 # [B, 1, 256, 256]
+            target_img_3ch = target_img.repeat(1, 3, 1, 1)   # [B, 3, 256, 256]
+            
+            # (c) 计算感知损失
+            z_vgg_loss = self.perceptual_loss(pred_img_3ch, target_img_3ch)
+        
+        # 8. (原代码) 为 Refine 阶段准备输入 (使用 .detach() 阻断梯度)
+        with torch.no_grad():
             coarse_pred_fm_sig = torch.sigmoid(coarse_pred_fm_logits.detach())
             uncertainty_map = 1.0 - torch.abs(coarse_pred_fm_sig - 0.5) * 2.0
 
-        # 8. Refine 阶段
+        # 9. Refine 阶段 (不变)
         combined_refine_input = torch.cat([coarse_pred_fm_logits.detach(), uncertainty_map.detach()], dim=1)
         pred_vm_crop, pred_fm_crop = self.refine_module(img_feat, combined_refine_input)
         
-        # 9. 计算 Refine Loss
+        # 10. 计算 Refine Loss (不变)
         pred_vm_crop = F.interpolate(pred_vm_crop, size=(256, 256), mode="nearest")
         pred_vm_crop_sig = torch.sigmoid(pred_vm_crop)
         loss_vm = self.refine_criterion(pred_vm_crop_sig, meta['vm_crop_gt'])
@@ -265,8 +270,10 @@ class C2F_Seg(nn.Module):
         
         loss_fm = loss_fm_bce + self.point_loss_weight * loss_fm_point
         
+        # 11. 【修改】更新日志
         logs = [
-            ("z_loss", z_loss.item()),
+            ("z_loss_mae", z_loss_mae.item()), # 原 MAE 损失
+            ("z_loss_vgg", z_vgg_loss.item()), # 新增 VGG 损失
             ("loss_vm", loss_vm.item()),
             ("loss_fm_bce", loss_fm_bce.item()),
             ("loss_fm_point", (self.point_loss_weight * loss_fm_point).item()),
@@ -274,8 +281,11 @@ class C2F_Seg(nn.Module):
         
         total_refine_loss = loss_vm + loss_fm
         
-        # 10. 返回加权后的损失
-        return self.z_loss_weight*z_loss, total_refine_loss, logs
+        # 12. 【修改】返回加权后的总损失
+        # 使用 config 中的权重
+        total_z_loss = (self.z_loss_weight * z_loss_mae) + (self.config.perceptual_weight * z_vgg_loss)
+        
+        return total_z_loss, total_refine_loss, logs
     
     def align_raw_size(self, full_mask, obj_position, vm_pad, meta):
         vm_np_crop = meta["vm_no_crop"].squeeze()
