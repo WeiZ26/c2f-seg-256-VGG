@@ -42,7 +42,7 @@ enc_layer: 6
 dec_layer: 12
 
 # train with img loss
-train_with_dec: False
+train_with_dec: True
 combined_vqgan: True
 gumbel_softmax: True 
 temp_start: 1.0 
